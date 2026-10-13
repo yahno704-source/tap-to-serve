@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Tap to Serve — Table</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="simon-lights" aria-hidden="true">
+    <div class="simon-light a"></div>
+    <div class="simon-light b"></div>
+    <div class="simon-light c"></div>
+    <div class="simon-light d"></div>
+  </div>
+  <div class="screen">
+    <div class="topbar">
+      <div class="title"><span id="tableLabel">Table</span></div>
+      <div id="statusPill" class="pill">—</div>
+    </div>
+    <div id="app" class="customer-main"></div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="ordertimer.js"></script>
+<script src="alerts.js"></script>
+<script src="customer-auth.js"></script>
+<script src="customer.js"></script>
+<script src="branding.js"></script>
+</body>
+</html>

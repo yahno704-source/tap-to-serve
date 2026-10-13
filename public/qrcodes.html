@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tap to Serve — QR Codes</title>
+<link rel="stylesheet" href="styles.css" />
+<style>
+  @media print {
+    .topbar, .no-print { display: none !important; }
+    body { background: white !important; }
+    .qr-card { break-inside: avoid; border: 1px solid #ccc !important; box-shadow: none !important; background: white !important; color: black !important; }
+    .qr-card .url-text, .qr-card .qr-label { color: #333 !important; }
+  }
+</style>
+</head>
+<body>
+  <div class="screen">
+    <div class="topbar">
+      <div class="title">🔳 Table QR Codes</div>
+      <button class="bill-btn no-print" onclick="window.print()" style="padding:8px 14px; font-size:12px;">Print</button>
+    </div>
+    <div style="padding:20px; max-width:900px; margin:0 auto;">
+      <p class="no-print" style="color:var(--muted); font-size:13px; line-height:1.5;">
+        Print these and put one at each table (or the door). Guests scan with their own phone's camera —
+        no app to install, it just opens the menu in their browser. <strong>Phones must be on the same WiFi
+        network as this server</strong> for the link to work.
+      </p>
+      <div id="app" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(300px,1fr)); gap:16px; margin-top:16px;"></div>
+    </div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="qrcodes.js"></script>
+</body>
+</html>

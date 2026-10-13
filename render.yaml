@@ -1,0 +1,15 @@
+# Render "Blueprint": tells Render how to run Tap to Serve.
+services:
+  - type: web
+    name: tap-to-serve
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Demo PIN that works for every staff role. Change it or set to "off" before real use.
+      - key: MASTER_PIN
+        value: "0000"

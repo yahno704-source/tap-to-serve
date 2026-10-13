@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tap to Serve — Waiter</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body class="waiter-page">
+  <div class="screen">
+    <div class="topbar w-topbar">
+      <div class="w-who">
+        <span class="color-dot" id="waiterDot"></span>
+        <span id="waiterName">Waiter</span>
+        <span id="sectionPill" class="pill">—</span>
+      </div>
+      <div class="w-top-actions">
+        <span id="ratingPill" class="w-stat" style="display:none; color:#f5c542;">★ —</span>
+        <span id="tipsPill" class="w-stat" style="display:none; color:var(--good);">Tips $0.00</span>
+        <button id="muteBtn" class="w-icon-btn" aria-label="Sound">🔔</button>
+        <button id="logoutBtn" class="w-icon-btn" style="display:none;" aria-label="Log out">Log out</button>
+      </div>
+    </div>
+    <div id="tabBar" class="w-tabs" style="display:none;">
+      <button id="tabTodo" class="w-tab active">To do</button>
+      <button id="tabRecap" class="w-tab">My shift</button>
+    </div>
+    <div id="alertBar" class="w-alertbar"></div>
+    <div id="app" class="w-app"></div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="ordertimer.js"></script>
+<script src="alerts.js"></script>
+<script src="staffmsg.js"></script>
+<script src="waiter.js"></script>
+</body>
+</html>

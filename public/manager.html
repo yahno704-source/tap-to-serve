@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tap to Serve — Manager</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="screen">
+    <div class="topbar">
+      <div class="title">Manager Overview</div>
+      <div style="display:flex; gap:8px;">
+        <button id="muteBtn" class="bill-btn" style="padding:8px 14px; font-size:12px;">🔔</button>
+        <button id="logoutBtn" class="bill-btn" style="display:none; padding:8px 14px; font-size:12px;">Log out</button>
+      </div>
+    </div>
+    <div id="app"></div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="ordertimer.js"></script>
+<script src="alerts.js"></script>
+<script src="floormap.js"></script>
+<script src="manager.js"></script>
+</body>
+</html>

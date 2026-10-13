@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Tap to Serve</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="landing">
+    <div class="simon-lights" aria-hidden="true">
+      <div class="simon-light a"></div>
+      <div class="simon-light b"></div>
+      <div class="simon-light c"></div>
+      <div class="simon-light d"></div>
+    </div>
+    <div class="logo">Tap <span>to</span> Serve</div>
+    <div class="tagline">Table-side ordering &amp; service, for waitstaff who don't want to walk over and ask.</div>
+    <div class="choices">
+      <div class="choice-card">
+        <div class="emoji">🚪</div>
+        <h2>I'm a Customer</h2>
+        <p>The iPad handed to you at the door — pick booth, bar, or table.</p>
+        <button class="big-btn" id="goCheckin">Check In</button>
+        <details style="width:100%; margin-top:2px;">
+          <summary style="color:var(--muted); font-size:12px; cursor:pointer;">Skip check-in (already seated)</summary>
+          <select id="tableSelect" style="margin-top:8px;"></select>
+          <button class="big-btn" id="goCustomer" style="margin-top:8px;">Open Table</button>
+        </details>
+      </div>
+      <div class="choice-card">
+        <div class="emoji">🧾</div>
+        <h2>I'm a Waiter</h2>
+        <p>See your section, color-coded, with live requests.</p>
+        <select id="waiterSelect"></select>
+        <button class="big-btn" id="goWaiter">Open Dashboard</button>
+      </div>
+      <div class="choice-card">
+        <div class="emoji">👨‍🍳</div>
+        <h2>I'm the Cook</h2>
+        <p>Kitchen queue — every food order, restaurant-wide.</p>
+        <button class="big-btn" id="goKitchen" style="margin-top:auto;">Open Kitchen</button>
+      </div>
+      <div class="choice-card">
+        <div class="emoji">🍸</div>
+        <h2>I'm the Bartender</h2>
+        <p>Drink queue — every drink order, restaurant-wide.</p>
+        <button class="big-btn" id="goBar" style="margin-top:auto;">Open Bar</button>
+      </div>
+      <div class="choice-card">
+        <div class="emoji">📋</div>
+        <h2>I'm a Manager</h2>
+        <p>Live view of every section, revenue, and tips.</p>
+        <button class="big-btn" id="goManager" style="margin-top:auto;">Open Overview</button>
+      </div>
+    </div>
+    <a href="/qrcodes.html" style="color:var(--muted); font-size:13px; margin-top:28px; text-decoration:none;">🔳 Print table QR codes (customers scan with their own phone) →</a>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const socket = io();
+  socket.on('state:full', (state) => {
+    const tableSelect = document.getElementById('tableSelect');
+    const waiterSelect = document.getElementById('waiterSelect');
+    if (!tableSelect.dataset.filled) {
+      tableSelect.innerHTML = Object.values(state.tables)
+        .sort((a, b) => a.number - b.number)
+        .map(t => `<option value="${t.id}">Table ${t.number} (${state.sections.find(s=>s.id===t.sectionId).name})</option>`)
+        .join('');
+      tableSelect.dataset.filled = '1';
+    }
+    if (!waiterSelect.dataset.filled) {
+      waiterSelect.innerHTML = state.waiters
+        .map(w => `<option value="${w.id}">${w.name} — ${state.sections.find(s=>s.id===w.sectionId).name}</option>`)
+        .join('');
+      waiterSelect.dataset.filled = '1';
+    }
+  });
+
+  document.getElementById('goCheckin').addEventListener('click', () => {
+    window.location.href = `/checkin.html`;
+  });
+  document.getElementById('goCustomer').addEventListener('click', () => {
+    const id = document.getElementById('tableSelect').value;
+    window.location.href = `/customer.html?table=${id}`;
+  });
+  document.getElementById('goWaiter').addEventListener('click', () => {
+    const id = document.getElementById('waiterSelect').value;
+    window.location.href = `/waiter.html?waiter=${id}`;
+  });
+  document.getElementById('goKitchen').addEventListener('click', () => {
+    window.location.href = `/kitchen.html`;
+  });
+  document.getElementById('goBar').addEventListener('click', () => {
+    window.location.href = `/bartender.html`;
+  });
+  document.getElementById('goManager').addEventListener('click', () => {
+    window.location.href = `/manager.html`;
+  });
+</script>
+<script src="branding.js"></script>
+</body>
+</html>
