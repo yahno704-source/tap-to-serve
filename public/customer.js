@@ -66,6 +66,132 @@ socket.on('customer:auth_required', () => {
   render();
 });
 
+// ---------------------------------------------------------------------------
+// End-of-visit survey. Remembered locally, because the table resets a few
+// seconds after payment and the page would otherwise lose track of the visit.
+// ---------------------------------------------------------------------------
+const AFTER_VISIT_KEY = 'tts_after_visit';
+const FEEDBACK_DONE_KEY = 'tts_feedback_done';
+let surveyDone = false;
+const survey = { service: 0, food: 0, back: null, comment: '' };
+
+function getAfterVisit() {
+  try {
+    const v = JSON.parse(localStorage.getItem(AFTER_VISIT_KEY) || 'null');
+    if (!v || v.tableId !== tableId || Date.now() - (v.ts || 0) > 2 * 60 * 60 * 1000) return null;
+    return v;
+  } catch { return null; }
+}
+function setAfterVisit(v) {
+  try {
+    const done = JSON.parse(localStorage.getItem(FEEDBACK_DONE_KEY) || '[]');
+    if (done.includes(v.feedbackId)) return;
+    const cur = getAfterVisit();
+    if (cur && cur.feedbackId === v.feedbackId) return;
+    localStorage.setItem(AFTER_VISIT_KEY, JSON.stringify({ ...v, ts: Date.now() }));
+  } catch {}
+}
+function finishAfterVisit(feedbackId) {
+  try {
+    const done = JSON.parse(localStorage.getItem(FEEDBACK_DONE_KEY) || '[]');
+    done.push(feedbackId);
+    localStorage.setItem(FEEDBACK_DONE_KEY, JSON.stringify(done.slice(-20)));
+    localStorage.removeItem(AFTER_VISIT_KEY);
+  } catch {}
+}
+
+function starRow(current, onPick) {
+  const row = document.createElement('div');
+  row.className = 'star-row';
+  [1, 2, 3, 4, 5].forEach((n) => {
+    const b = document.createElement('button');
+    b.className = 'star-btn' + (n <= current ? ' on' : '');
+    b.textContent = '★';
+    b.setAttribute('aria-label', `${n} stars`);
+    b.addEventListener('click', () => onPick(n));
+    row.appendChild(b);
+  });
+  return row;
+}
+
+function renderSurvey(fb) {
+  app.innerHTML = '';
+  const intro = document.createElement('div');
+  intro.className = 'waiting-block';
+  intro.style.cssText = 'flex:none; min-height:0; padding:18px 0 4px;';
+  intro.innerHTML = `<div class="big-emoji">🙏</div><h1>Thanks — you're all paid!</h1><p>Two quick questions about your visit. It takes 20 seconds.</p>`;
+  app.appendChild(intro);
+
+  const card = document.createElement('div');
+  card.className = 'complaint-card';
+  const q = (text) => { const t = document.createElement('div'); t.className = 'section-title'; t.style.margin = '10px 0 4px'; t.textContent = text; return t; };
+
+  card.appendChild(q('How was our service?'));
+  card.appendChild(starRow(survey.service, (n) => { survey.service = n; renderSurvey(fb); }));
+  card.appendChild(q('How were the food and drinks?'));
+  card.appendChild(starRow(survey.food, (n) => { survey.food = n; renderSurvey(fb); }));
+
+  card.appendChild(q('Would you come back?'));
+  const chips = document.createElement('div');
+  chips.className = 'chip-row';
+  [['yes', '👍 Yes'], ['maybe', '🤔 Maybe'], ['no', '👎 No']].forEach(([val, label]) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (survey.back === val ? ' selected' : '');
+    b.textContent = label;
+    b.addEventListener('click', () => { survey.back = val; renderSurvey(fb); });
+    chips.appendChild(b);
+  });
+  card.appendChild(chips);
+
+  card.appendChild(q('Anything we could do better? (optional)'));
+  const input = document.createElement('textarea');
+  input.className = 'pin-input';
+  input.rows = 3;
+  input.maxLength = 300;
+  input.placeholder = 'Tell us what went well or what to fix…';
+  input.style.cssText = 'letter-spacing:normal; font-size:14px; text-align:left; padding:10px 12px; width:100%; box-sizing:border-box; resize:vertical;';
+  input.value = survey.comment;
+  input.addEventListener('input', () => { survey.comment = input.value; });
+  card.appendChild(input);
+
+  const send_ = document.createElement('button');
+  send_.className = 'send-order-btn';
+  send_.style.cssText = 'width:100%; margin-top:12px;';
+  send_.disabled = survey.service === 0;
+  send_.textContent = survey.service === 0 ? 'Pick a service rating to send' : 'Send feedback';
+  send_.addEventListener('click', () => {
+    socket.emit('customer:feedback', { feedbackId: fb.feedbackId, service: survey.service, food: survey.food, wouldReturn: survey.back, comment: survey.comment });
+    finishAfterVisit(fb.feedbackId);
+    Object.assign(survey, { service: 0, food: 0, back: null, comment: '' });
+    surveyDone = true;
+    render();
+  });
+  card.appendChild(send_);
+
+  const skip = document.createElement('button');
+  skip.className = 'bill-btn';
+  skip.style.cssText = 'width:100%; margin-top:8px;';
+  skip.textContent = 'Skip';
+  skip.addEventListener('click', () => {
+    finishAfterVisit(fb.feedbackId);
+    surveyDone = true;
+    render();
+  });
+  card.appendChild(skip);
+  app.appendChild(card);
+}
+
+function renderSurveyThanks() {
+  app.innerHTML = `
+    <div class="thankyou">
+      <div class="big-emoji">🎉</div>
+      <h1>Thank you!</h1>
+      <p>We appreciate you. See you again soon!</p>
+    </div>
+    <button class="bill-btn" id="surveyDoneBtn" style="width:100%; margin-top:14px;">Done</button>`;
+  document.getElementById('surveyDoneBtn').addEventListener('click', () => { surveyDone = false; render(); });
+}
+
 function send(event, payload) {
   socket.emit(event, { tableId, ...payload });
 }
@@ -82,6 +208,20 @@ function render() {
   statusPill.textContent = STATUS_LABEL[table.status] || table.status;
   statusPill.style.background = section.color + '33';
   statusPill.style.color = section.color;
+
+  // End-of-visit survey: shown as soon as the bill is paid, and kept after the table resets.
+  if (surveyDone) {
+    if (table.status === 'empty' || (table.bill && table.bill.paid)) { renderSurveyThanks(); return; }
+    surveyDone = false;
+  }
+  if (table.bill && table.bill.paid && table.bill.feedbackId && !table.bill.alreadyRated) {
+    setAfterVisit({ feedbackId: table.bill.feedbackId, tableId, tableNumber: table.number });
+  }
+  const pendingSurvey = getAfterVisit();
+  if (pendingSurvey && (table.status === 'empty' || (table.bill && table.bill.paid))) {
+    renderSurvey(pendingSurvey);
+    return;
+  }
 
   if (table.status === 'empty') {
     // An account is required to claim a table.
@@ -130,7 +270,7 @@ function render() {
   // Seated: full app
   // One call only: Alerts.process remembers just the last set of keys it saw.
   Alerts.process([
-    ...(table.messages || []).map((m) => ({ key: `msg:${m.id}`, text: `💬 Waiter: ${m.text}` })),
+    ...(table.messages || []).map((m) => ({ key: `msg:${m.id}`, text: `💬 ${m.from === 'manager' ? 'Manager' : 'Waiter'}: ${m.text}` })),
     ...table.requests
       .filter((r) => r.status === 'done')
       .map((r) => ({
@@ -321,6 +461,7 @@ function renderMenuSection(category, heading) {
 
 function renderSendOrderButton() {
   const wrap = document.createElement('div');
+  wrap.className = 'order-bar';
   const totalQty = Object.values(cart).reduce((a, c) => a + c.qty, 0);
   const cartTotal = Object.entries(cart).reduce((sum, [id, c]) => {
     const item = state.menu.find((m) => m.id === id);
@@ -328,6 +469,7 @@ function renderSendOrderButton() {
   }, 0);
 
   if (totalQty > 0) {
+    wrap.classList.add('has-items'); // floats at the bottom of the screen while choosing
     const totalLine = document.createElement('div');
     totalLine.className = 'bill-line';
     totalLine.style.cssText = 'padding: 0 2px 10px;';
@@ -390,7 +532,8 @@ function formatItemLine(i) {
 function renderWaiterMessagesSection(table) {
   const wrap = document.createElement('div');
   if (!table.messages || !table.messages.length) return wrap;
-  wrap.innerHTML = `<div class="section-title">💬 From Your Waiter</div>`;
+  const fromManager = table.messages.some((m) => m.from === 'manager');
+  wrap.innerHTML = `<div class="section-title">💬 ${fromManager ? 'From Your Team' : 'From Your Waiter'}</div>`;
   const list = document.createElement('div');
   list.className = 'order-list';
   table.messages
@@ -398,9 +541,9 @@ function renderWaiterMessagesSection(table) {
     .reverse()
     .forEach((m) => {
       const row = document.createElement('div');
-      row.className = 'order-row';
+      row.className = 'order-row' + (m.from === 'manager' ? ' manager-msg' : '');
       row.innerHTML = `
-        <div class="items">${CustomerAuth.escapeHtml(m.text)}</div>
+        <div class="items">${m.from === 'manager' ? '<b>📣 Manager:</b> ' : ''}${CustomerAuth.escapeHtml(m.text)}</div>
         <span class="order-clock" data-order-ts="${m.ts}"></span>`;
       list.appendChild(row);
     });
@@ -416,7 +559,7 @@ function renderVisitTimelineSection(table) {
   return wrap;
 }
 
-const REQUEST_ORDER = ['service', 'utensils', 'ketchup', 'napkins'];
+const REQUEST_ORDER = ['service', 'utensils', 'ketchup', 'napkins', 'clean', 'bathroom'];
 
 function renderRequests(table) {
   const wrap = document.createElement('div');
@@ -438,6 +581,7 @@ function renderRequests(table) {
     btn.innerHTML = `
       <div class="emoji">${meta.icon}</div>
       <div>${meta.label}</div>
+      ${!pending && !finished && meta.hint ? `<div class="request-hint">${meta.hint}</div>` : ''}
       ${pending ? `
         <div class="status-label">${pending.status === 'accepted' ? 'Being handled' : 'Sent — waiting'}</div>
         <span class="order-clock" data-order-ts="${pending.ts}"></span>
@@ -487,6 +631,7 @@ function renderBillOrThankYou(table) {
 
   const tipOptions = [15, 18, 20, 25];
   const subtotal = table.bill.subtotal;
+  const deposit = table.bill.deposit || 0;
   const tipAmount = selectedTip === null ? 0 : selectedTip === 'custom' ? 0 : Math.round(subtotal * (selectedTip / 100) * 100) / 100;
 
   wrap.innerHTML = `<div class="section-title" style="display:flex; align-items:center; justify-content:space-between;">Your Bill — Table ${table.number} <span class="order-clock" data-order-ts="${table.bill.deliveredAt}" style="text-transform:none; letter-spacing:normal;"></span></div>`;
@@ -496,6 +641,8 @@ function renderBillOrThankYou(table) {
     <div class="bill-line"><span>Subtotal</span><span>$${subtotal.toFixed(2)}</span></div>
     <div class="bill-line"><span>Tip</span><span id="tipAmountLabel">$${tipAmount.toFixed(2)}</span></div>
     <div class="bill-line total"><span>Total</span><span id="totalLabel">$${(subtotal + tipAmount).toFixed(2)}</span></div>
+    ${deposit > 0 ? `<div class="bill-line"><span>Paid up front (pre-order)</span><span style="color:var(--good);">−$${deposit.toFixed(2)}</span></div>
+    <div class="bill-line total"><span>Due now</span><span id="dueLabel">$${Math.max(0, subtotal + tipAmount - deposit).toFixed(2)}</span></div>` : ''}
     <div class="section-title" style="margin-top:4px;">Add a Tip</div>
     <div class="tip-row" id="tipRow">
       ${tipOptions.map((p) => `<button class="tip-btn" data-pct="${p}">${p}%</button>`).join('')}

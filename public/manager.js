@@ -234,6 +234,39 @@ function getSettingsPanel() {
   })));
   settingsEls.alarm = alarm;
 
+  // Demo scene: a full restaurant, so the next guest sees the waiting line + pre-order offer
+  const fillWrap = field('Demo: show the waiting line');
+  const fillRow = document.createElement('div');
+  fillRow.style.cssText = 'display:flex; gap:8px; flex-wrap:wrap; align-items:center;';
+  const fillSel = document.createElement('select');
+  fillSel.className = 'staff-select';
+  fillSel.style.width = 'auto';
+  [[2, 'first table opens in ~2 min'], [5, 'first table opens in ~5 min'], [10, 'first table opens in ~10 min'], [20, 'first table opens in ~20 min']].forEach(([v, tx]) => {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = tx;
+    fillSel.appendChild(o);
+  });
+  fillSel.value = '5';
+  const fillBtn = document.createElement('button');
+  fillBtn.className = 'big-btn';
+  fillBtn.style.cssText = 'width:auto; margin:0; padding:12px 22px;';
+  fillBtn.textContent = '🍽️ Fill the restaurant';
+  const fillMsg = note(document.createElement('div'));
+  fillBtn.addEventListener('click', () => {
+    const auth = getAuth();
+    if (auth) socket.emit('manager:demo_fill', { token: auth.token, openInMin: Number(fillSel.value) });
+  });
+  socket.on('manager:demo_done', ({ filled, first }) => {
+    fillMsg.textContent = filled
+      ? `✓ ${filled} tables now busy. A guest checking in will wait about ${first} min. Pre-ordered food reaches the kitchen ~3 min before that.`
+      : 'Every table was already taken.';
+    setTimeout(() => { fillMsg.textContent = ''; }, 9000);
+  });
+  fillRow.append(fillSel, fillBtn);
+  fillWrap.append(fillRow, fillMsg, note(Object.assign(document.createElement('div'), {
+    textContent: 'Pick 2 minutes to show the whole pre-order → kitchen flow live; pick 20 to show a long wait. Use "Reset demo" first for a clean start.',
+  })));
   // Reset
   const resetWrap = field('Start fresh');
   const reset = document.createElement('button');
@@ -424,11 +457,20 @@ function renderDashboard() {
       key: `sg:${s.id}`,
       text: '💡 New anonymous suggestion',
     })),
+    ...Object.values(tables).flatMap((t) =>
+      t.requests
+        .filter((r) => r.type === 'bathroom' && r.status !== 'done')
+        .map((r) => ({ key: `bath:${r.id}`, text: `🚻 Bathroom maintenance needed — reported from Table ${t.number}` }))
+    ),
   ]);
 
   // Keep the compose box usable across live refreshes (focus + caret).
   const typing = [staffPanel, settingsPanel].find((p) => p && p.contains(document.activeElement)) ? document.activeElement : null;
   const caret = typing && typing.selectionStart !== undefined ? [typing.selectionStart, typing.selectionEnd] : null;
+
+  // Keep the cursor in a reply box while the screen refreshes live.
+  const activeKey = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.focuskey : null;
+  const activeSel = activeKey ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
 
   app.innerHTML = '';
   app.className = '';
@@ -440,6 +482,32 @@ function renderDashboard() {
     (sum, t) => sum + t.requests.filter((r) => r.status === 'open' || r.status === 'accepted').length,
     0
   );
+
+  // Bathroom maintenance: a flashing red bar at the very top until someone handles it.
+  const bathroomReqs = allTables.flatMap((t) =>
+    t.requests.filter((r) => r.type === 'bathroom' && r.status !== 'done').map((r) => ({ t, r }))
+  );
+  bathroomReqs.forEach(({ t, r }) => {
+    const section = sections.find((s) => s.id === t.sectionId);
+    const bar = document.createElement('div');
+    bar.className = 'bathroom-banner flash-red';
+    const info = document.createElement('div');
+    info.className = 'bathroom-banner-text';
+    info.innerHTML = `<b>🚻 Bathroom maintenance needed</b> <span>reported from Table ${t.number}${section ? ' · ' + escapeHtml(section.name) : ''}${r.status === 'accepted' ? ' · someone is on it' : ''}</span>`;
+    const clock = document.createElement('span');
+    clock.className = 'order-clock';
+    clock.dataset.orderTs = r.ts;
+    clock.dataset.alarm = '1';
+    info.appendChild(clock);
+    const btn = document.createElement('button');
+    btn.textContent = '✓ Handled';
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      socket.emit('waiter:resolve_request', { tableId: t.id, requestId: r.id });
+    });
+    bar.append(info, btn);
+    app.appendChild(bar);
+  });
 
   const statRow = document.createElement('div');
   statRow.style.cssText = 'display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px;';
@@ -456,6 +524,9 @@ function renderDashboard() {
     statRow.appendChild(tile);
   });
   app.appendChild(statRow);
+
+  app.appendChild(renderRequestsBoard(tables, sections, requestTypes));
+  app.appendChild(renderSeatingPanel(waitlist || [], tables, sections, seatTypes, recentVisits || []));
 
   app.appendChild(getSettingsPanel());
   syncSettingsPanel(managerState.settings);
@@ -477,7 +548,7 @@ function renderDashboard() {
   app.appendChild(renderFeedbackPanel(analytics, suggestions || []));
   app.appendChild(renderVisitLogPanel(recentVisits || [], sections));
   app.appendChild(renderWaitlistPanel(waitlist || [], seatTypes, tables, sections));
-  app.appendChild(renderComplaintsPanel(complaints || [], sections));
+  app.appendChild(renderComplaintsPanel(complaints || [], sections, tables));
 
   sections.forEach((section) => {
     const block = document.createElement('div');
@@ -500,6 +571,15 @@ function renderDashboard() {
     block.appendChild(grid);
     app.appendChild(block);
   });
+
+  // Put the cursor back in the reply box the manager was typing in.
+  if (activeKey) {
+    const el = app.querySelector(`[data-focuskey="${activeKey}"]`);
+    if (el) {
+      el.focus({ preventScroll: true });
+      if (activeSel) { try { el.setSelectionRange(activeSel[0], activeSel[1]); } catch {} }
+    }
+  }
 }
 
 function fmtDuration(secs) {
@@ -685,7 +765,7 @@ function renderFeedbackPanel(a, suggestions) {
   a.recentRatings.forEach((r) => {
     const row = document.createElement('div');
     row.style.cssText = card;
-    row.innerHTML = `<div style="color:#f5c542; letter-spacing:2px;">${stars(r.stars)} <span style="color:var(--muted); font-size:12px; letter-spacing:0;">Table ${r.tableNumber}</span></div>` +
+    row.innerHTML = `<div style="color:#f5c542; letter-spacing:2px;">${stars(r.stars)} <span style="color:var(--muted); font-size:12px; letter-spacing:0;">service · Table ${r.tableNumber}</span>${r.food ? ` <span style="color:var(--muted); font-size:12px; letter-spacing:0;">· food ${stars(r.food)}</span>` : ''}${r.wouldReturn ? ` <span style="font-size:12px; letter-spacing:0; color:${r.wouldReturn === 'yes' ? 'var(--good)' : r.wouldReturn === 'no' ? 'var(--danger)' : 'var(--warn)'};">· would ${r.wouldReturn === 'yes' ? 'return' : r.wouldReturn === 'no' ? 'NOT return' : 'maybe return'}</span>` : ''}</div>` +
       (r.comment ? `<div style="color:var(--muted); font-size:13px; margin-top:4px;"></div>` : '');
     if (r.comment) row.lastChild.textContent = r.comment;
     left.appendChild(row);
@@ -740,7 +820,7 @@ function renderWaitlistPanel(waitlist, seatTypes, tables, sections) {
     card.className = 'waitlist-card';
 
     const left = document.createElement('div');
-    left.innerHTML = `<div class="who">${entry.guestName ? `<strong>${escapeHtml(entry.guestName)}</strong> · ` : ''}${meta.icon} ${meta.label} wanted — party of ${entry.partySize || 1}</div><div class="wait-time">Waiting <span class="order-clock" data-order-ts="${entry.ts}" data-alarm="1"></span></div>`;
+    left.innerHTML = `<div class="who">${entry.guestName ? `<strong>${escapeHtml(entry.guestName)}</strong> · ` : ''}${meta.icon} ${meta.label} wanted — party of ${entry.partySize || 1}</div><div class="wait-time">Waiting <span class="order-clock" data-order-ts="${entry.ts}" data-alarm="1"></span>${entry.queue ? ` · #${entry.queue.position} in line` + (entry.queue.estSeatAt ? ` · table expected ${new Date(entry.queue.estSeatAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : '') : ''}</div>${entry.preorder ? `<div class="wait-time" style="color:var(--good);">🥡 Pre-ordered · half paid ($${entry.preorder.deposit.toFixed(2)} of $${entry.preorder.subtotal.toFixed(2)}) · food ${entry.preorder.foodStatus === 'held' ? 'held until ~3 min before the table' : (entry.preorder.foodStatus || 'drinks only')}</div>` : ''}`;
     card.appendChild(left);
 
     const matches = Object.values(tables).filter((t) => t.status === 'empty' && t.seatType === entry.seatType);
@@ -764,7 +844,7 @@ function renderWaitlistPanel(waitlist, seatTypes, tables, sections) {
   return wrap;
 }
 
-function renderComplaintsPanel(complaints, sections) {
+function renderComplaintsPanel(complaints, sections, tables) {
   const wrap = document.createElement('div');
   wrap.style.marginBottom = '24px';
 
@@ -795,7 +875,7 @@ function renderComplaintsPanel(complaints, sections) {
       row.innerHTML = `
         <div>
           <div style="font-weight:700; font-size:13px; margin-bottom:2px; display:flex; align-items:center; gap:8px;">Table ${c.tableNumber} — ${section ? section.name : ''} <span class="order-clock" data-order-ts="${c.ts}"${c.status === 'open' ? ' data-alarm="1"' : ''}></span></div>
-          <div style="color:var(--muted); font-size:13px;">${c.message}</div>
+          <div style="color:var(--muted); font-size:13px;">${escapeHtml(c.message)}</div>
         </div>`;
       if (c.status === 'open') {
         const btn = document.createElement('button');
@@ -810,9 +890,218 @@ function renderComplaintsPanel(complaints, sections) {
         row.appendChild(tag);
       }
       list.appendChild(row);
+
+      // What the manager has already told this guest, and a box to write back
+      if (c.replies && c.replies.length) {
+        c.replies.forEach((r) => {
+          const sent = document.createElement('div');
+          sent.className = 'mgr-reply-sent';
+          sent.innerHTML = `↩ You replied: <b>${escapeHtml(r.text)}</b> <span class="order-clock" data-order-ts="${r.ts}"></span>`;
+          list.appendChild(sent);
+        });
+      }
+      if (c.status === 'open') {
+        const t = tables[c.tableId];
+        if (t && t.status === 'seated') {
+          list.appendChild(replyBox(c.tableId, c.id));
+        } else {
+          const gone = document.createElement('div');
+          gone.className = 'mgr-reply-sent';
+          gone.textContent = 'The guest has left the table, so a reply cannot be delivered.';
+          list.appendChild(gone);
+        }
+      }
     });
 
   wrap.appendChild(list);
+  return wrap;
+}
+
+const mgrOpen = new Set(); // which table timelines the manager has open (survives live refreshes)
+const mgrDrafts = {}; // half-typed replies, kept across live refreshes
+
+// Ready-made replies; tapping one fills the box so the manager can tweak it before sending.
+const QUICK_REPLIES = [
+  "I'm on my way to your table right now.",
+  "I'm so sorry about that. I'm coming over to make it right.",
+  'Thank you for telling us. We are fixing it right now.',
+];
+
+// A small compose box that sends a message to the guest at this table. Used on complaints and table cards.
+function replyBox(tableId, complaintId) {
+  const key = complaintId ? `c:${complaintId}` : `t:${tableId}`;
+  const box = document.createElement('div');
+  box.className = 'mgr-reply';
+
+  const chips = document.createElement('div');
+  chips.className = 'chip-row';
+  const row = document.createElement('div');
+  row.className = 'mgr-reply-row';
+  const input = document.createElement('input');
+  input.className = 'staff-select';
+  input.maxLength = 300;
+  input.placeholder = 'Write back to the guest…';
+  input.dataset.focuskey = `reply:${key}`;
+  input.value = mgrDrafts[key] || '';
+  input.addEventListener('input', () => { mgrDrafts[key] = input.value; });
+
+  QUICK_REPLIES.forEach((text) => {
+    const c = document.createElement('button');
+    c.className = 'chip';
+    c.textContent = text;
+    c.addEventListener('click', () => { input.value = text; mgrDrafts[key] = text; input.focus(); });
+    chips.appendChild(c);
+  });
+
+  const send = document.createElement('button');
+  send.className = 'big-btn';
+  send.style.cssText = 'width:auto; margin:0; padding:10px 18px;';
+  send.textContent = 'Send to guest';
+  const status = document.createElement('span');
+  status.className = 'mgr-reply-status';
+  const go = () => {
+    const text = input.value.trim();
+    const auth = getAuth();
+    if (!text || !auth) return;
+    socket.emit('manager:message_guest', { token: auth.token, tableId, text, complaintId });
+    input.value = '';
+    mgrDrafts[key] = '';
+    status.textContent = '✓ Sent';
+  };
+  send.addEventListener('click', go);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  row.append(input, send);
+  box.append(chips, row, status);
+  return box;
+}
+
+// Everything guests are asking for or waiting on right now, oldest first.
+function renderRequestsBoard(tables, sections, requestTypes) {
+  const wrap = document.createElement('div');
+  wrap.className = 'mgr-panel';
+  const reqs = [];
+  const orders = [];
+  Object.values(tables).forEach((t) => {
+    t.requests.filter((r) => r.status === 'open' || r.status === 'accepted').forEach((r) => reqs.push({ t, r }));
+    [...t.drinkOrders.map((o) => ({ o, icon: '🥤' })), ...t.foodOrders.map((o) => ({ o, icon: '🍔' }))]
+      .filter(({ o }) => o.status !== 'delivered')
+      .forEach(({ o, icon }) => orders.push({ t, o, icon }));
+  });
+  reqs.sort((a, b) => a.r.ts - b.r.ts);
+  orders.sort((a, b) => a.o.ts - b.o.ts);
+
+  const head = document.createElement('div');
+  head.className = 'mgr-panel-head';
+  head.innerHTML = `<b>📣 What guests are asking for</b><span class="pill" style="background:var(--panel-2); color:var(--muted);">${reqs.length} request${reqs.length === 1 ? '' : 's'} · ${orders.length} order${orders.length === 1 ? '' : 's'} open</span>`;
+  wrap.appendChild(head);
+
+  if (!reqs.length && !orders.length) {
+    const n = document.createElement('div');
+    n.className = 'empty-note';
+    n.textContent = 'Nothing waiting. New requests and orders show up here the moment a guest sends them.';
+    wrap.appendChild(n);
+    return wrap;
+  }
+
+  const row = (t, icon, text, status, ts, extraClock) => {
+    const section = sections.find((s) => s.id === t.sectionId);
+    const r = document.createElement('div');
+    r.className = 'mgr-row';
+    r.style.borderLeftColor = section ? section.color : 'var(--border)';
+    r.innerHTML = `<div class="mgr-row-main"><b>Table ${t.number}</b> <span class="mgr-sec">${section ? escapeHtml(section.name) : ''}${t.guestName ? ' · ' + escapeHtml(t.guestName) : ''}</span><div class="mgr-row-what">${icon} ${escapeHtml(text)}</div></div>` +
+      `<div class="mgr-row-side"><span class="mgr-status">${status}</span><span class="order-clock" data-order-ts="${ts}" data-alarm="1"></span>${extraClock || ''}</div>`;
+    return r;
+  };
+
+  reqs.forEach(({ t, r }) => {
+    const meta = requestTypes[r.type] || { icon: '•', label: r.type };
+    const text = r.type === 'special' ? `Special request: ${r.message}` : r.type === 'bill' ? 'Wants the bill' : meta.label + (meta.hint ? ` — ${meta.hint}` : '');
+    wrap.appendChild(row(t, meta.icon, text, r.status === 'accepted' ? '👀 waiter is on it' : '⏳ not seen yet', r.ts,
+      r.acceptedAt ? `<span class="mgr-sub">seen <span class="order-clock" data-order-ts="${r.acceptedAt}"></span></span>` : ''));
+  });
+  orders.forEach(({ t, o, icon }) => {
+    const items = o.items.map((i) => `${i.qty}× ${i.name}${i.note ? ` (${i.note})` : ''}`).join(', ');
+    const where = icon === '🥤' ? 'bar' : 'kitchen';
+    wrap.appendChild(row(t, icon, items + (o.preorder ? ' (pre-order)' : ''), `${where}: ${o.status}`, o.ts));
+  });
+  return wrap;
+}
+
+// Who walked in, how long they waited for a table, and when they were seated.
+function renderSeatingPanel(waitlist, tables, sections, seatTypes, recentVisits) {
+  const wrap = document.createElement('div');
+  wrap.className = 'mgr-panel';
+  const waiting = waitlist.filter((w) => w.status === 'waiting');
+  const seatedNow = Object.values(tables)
+    .filter((t) => t.status === 'seated' || t.status === 'needs_greeting')
+    .sort((a, b) => (b.seatedAt || b.arrivedAt || 0) - (a.seatedAt || a.arrivedAt || 0));
+  const waits = [
+    ...seatedNow.filter((t) => t.arrivedAt && t.seatedAt).map((t) => t.seatedAt - t.arrivedAt),
+    ...recentVisits.filter((v) => v.arrivedAt && v.seatedAt).map((v) => v.seatedAt - v.arrivedAt),
+  ];
+  const avg = waits.length ? waits.reduce((a, b) => a + b, 0) / waits.length : null;
+
+  const head = document.createElement('div');
+  head.className = 'mgr-panel-head';
+  head.innerHTML = `<b>🪑 Seating &amp; wait times</b><span class="pill" style="background:var(--panel-2); color:var(--muted);">${waiting.length} waiting · avg wait ${avg === null ? '—' : durationLabel(avg)}</span>`;
+  wrap.appendChild(head);
+
+  const line = (cls, html, color) => {
+    const r = document.createElement('div');
+    r.className = 'mgr-row ' + cls;
+    if (color) r.style.borderLeftColor = color;
+    r.innerHTML = html;
+    wrap.appendChild(r);
+  };
+  const sub = (txt) => {
+    const h = document.createElement('div');
+    h.className = 'mgr-sub-head';
+    h.textContent = txt;
+    wrap.appendChild(h);
+  };
+
+  if (waiting.length) {
+    sub('Waiting for a table now');
+    waiting.forEach((w) => {
+      const meta = seatTypes[w.seatType];
+      const q = w.queue;
+      line('waiting',
+        `<div class="mgr-row-main"><b>${escapeHtml(w.guestName || 'Guest')}</b> · party of ${w.partySize || 1} · ${meta.icon} ${meta.label}` +
+        `<div class="mgr-row-what">Arrived ${clockTimeLabel(w.ts)}${q ? ` · #${q.position} in line` : ''}${q && q.estSeatAt ? ` · table expected ${clockTimeLabel(q.estSeatAt)}` : ''}` +
+        `${w.preorder ? ` · 🥡 pre-ordered, half paid ($${w.preorder.deposit.toFixed(2)})` : ''}</div></div>` +
+        `<div class="mgr-row-side"><span class="mgr-status">waiting</span><span class="order-clock" data-order-ts="${w.ts}" data-alarm="1"></span></div>`);
+    });
+  }
+
+  sub('Seated');
+  if (!seatedNow.length) {
+    const n = document.createElement('div');
+    n.className = 'empty-note';
+    n.textContent = 'Nobody is seated yet.';
+    wrap.appendChild(n);
+  }
+  seatedNow.forEach((t) => {
+    const section = sections.find((s) => s.id === t.sectionId);
+    const waited = t.arrivedAt && t.seatedAt ? durationLabel(t.seatedAt - t.arrivedAt) : '—';
+    line('seated',
+      `<div class="mgr-row-main"><b>${escapeHtml(t.guestName || 'Guest')}</b> · Table ${t.number}${t.partySize ? ` · party of ${t.partySize}` : ''} <span class="mgr-sec">${section ? escapeHtml(section.name) : ''}</span>` +
+      `<div class="mgr-row-what">${t.arrivedAt ? `Arrived ${clockTimeLabel(t.arrivedAt)} · ` : ''}${t.seatedAt ? `Seated ${clockTimeLabel(t.seatedAt)}` : 'not greeted yet'}</div></div>` +
+      `<div class="mgr-row-side"><span class="mgr-status">${t.seatedAt ? `waited ${waited}` : 'at the door'}</span></div>`,
+      section ? section.color : null);
+  });
+
+  if (recentVisits.length) {
+    sub('Finished today');
+    recentVisits.slice(0, 10).forEach((v) => {
+      const section = sections.find((s) => s.id === v.sectionId);
+      const waited = v.arrivedAt && v.seatedAt ? durationLabel(v.seatedAt - v.arrivedAt) : '—';
+      line('done',
+        `<div class="mgr-row-main"><b>${escapeHtml(v.guestName || 'Guest')}</b> · Table ${v.tableNumber}${v.partySize ? ` · party of ${v.partySize}` : ''} <span class="mgr-sec">${section ? escapeHtml(section.name) : ''}</span>` +
+        `<div class="mgr-row-what">${v.arrivedAt ? `Arrived ${clockTimeLabel(v.arrivedAt)} · ` : ''}Seated ${clockTimeLabel(v.seatedAt)} · left ${clockTimeLabel(v.closedAt)} (${durationLabel(v.closedAt - v.seatedAt)} at table)</div></div>` +
+        `<div class="mgr-row-side"><span class="mgr-status">waited ${waited}${v.unpaid ? ' · left without paying' : ''}</span></div>`,
+        section ? section.color : null);
+    });
+  }
   return wrap;
 }
 
@@ -834,7 +1123,7 @@ function renderTableCard(table, section, requestTypes, seatTypes, complaints) {
     .forEach((c) => {
       const alert = document.createElement('div');
       alert.className = 'complaint-alert';
-      alert.innerHTML = `<span>🚩 ${c.message}</span>`;
+      alert.innerHTML = `<span>🚩 ${escapeHtml(c.message)}</span>`;
       card.appendChild(alert);
     });
 
@@ -845,7 +1134,7 @@ function renderTableCard(table, section, requestTypes, seatTypes, complaints) {
     openRequests.forEach((r) => {
       const meta = requestTypes[r.type];
       const chip = document.createElement('div');
-      chip.className = 'chip' + (r.type === 'bill' ? ' bill' : '') + (r.status === 'accepted' ? ' accepted' : '');
+      chip.className = 'chip' + (r.type === 'bill' ? ' bill' : '') + (r.status === 'accepted' ? ' accepted' : '') + (r.type === 'bathroom' ? ' flash-red' : '');
       const what = r.type === 'special' ? r.message : meta.label;
       chip.textContent = `${meta.icon} ${what}${r.status === 'accepted' ? ' (in progress)' : ''} `;
       // Live wait clock; passes 10 minutes -> flashing light + siren.
@@ -859,14 +1148,85 @@ function renderTableCard(table, section, requestTypes, seatTypes, complaints) {
     card.appendChild(chipRow);
   }
 
-  const openOrders = [...table.drinkOrders, ...table.foodOrders].filter((o) => o.status !== 'delivered');
-  if (openOrders.length) {
-    const oldest = openOrders.reduce((a, b) => (a.ts < b.ts ? a : b));
-    const note = document.createElement('div');
-    note.className = 'empty-note';
-    note.style.cssText = 'padding:4px 0; display:flex; align-items:center; justify-content:center; gap:6px;';
-    note.innerHTML = `${openOrders.length} order${openOrders.length > 1 ? 's' : ''} in progress — oldest <span class="order-clock" data-order-ts="${oldest.ts}" data-alarm="1"></span>`;
-    card.appendChild(note);
+  // Who is at the table and how long they waited to be seated
+  if (table.status !== 'empty') {
+    const who = document.createElement('div');
+    who.className = 'mgr-who';
+    const waited = table.arrivedAt && table.seatedAt ? ` · waited <b>${durationLabel(table.seatedAt - table.arrivedAt)}</b> for a table` : '';
+    who.innerHTML = `👤 <b>${escapeHtml(table.guestName || 'Guest')}</b>${table.partySize ? ` · party of ${table.partySize}` : ''}` +
+      (table.seatedAt ? `<br><span>Seated ${clockTimeLabel(table.seatedAt)}${waited}</span>` : '<br><span>Waiting to be greeted</span>') +
+      (table.deposit > 0 ? `<br><span style="color:var(--good);">🥡 Pre-order · $${table.deposit.toFixed(2)} paid up front</span>` : '');
+    card.appendChild(who);
+  }
+
+  // Everything the table has ordered, newest first, with where each order is
+  const orders = [
+    ...table.drinkOrders.map((o) => ({ o, icon: '🥤' })),
+    ...table.foodOrders.map((o) => ({ o, icon: '🍔' })),
+  ].sort((a, b) => b.o.ts - a.o.ts);
+  if (orders.length) {
+    const list = document.createElement('div');
+    list.className = 'mgr-orders';
+    orders.forEach(({ o, icon }) => {
+      const row = document.createElement('div');
+      row.className = 'mgr-order-row';
+      const items = o.items.map((i) => `${i.qty}× ${i.name}${i.note ? ` (${i.note})` : ''}`).join(', ');
+      const done = o.status === 'delivered';
+      row.innerHTML = `<span>${icon} ${escapeHtml(items)}${o.preorder ? ' <i>pre-order</i>' : ''}</span>` +
+        `<span class="mgr-order-meta"><b class="st-${o.status}">${o.status}</b> ` +
+        (done ? `· took ${durationLabel((o.deliveredAt || o.ts) - o.ts)}` : `<span class="order-clock" data-order-ts="${o.ts}" data-alarm="1"></span>`) + '</span>';
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  // Write to the guest at this table (e.g. "I'm on my way"). Shows on their screen as coming from the manager.
+  if (table.status === 'seated') {
+    const key = `msg:${table.id}`;
+    const d = document.createElement('details');
+    d.className = 'mgr-timeline';
+    if (mgrOpen.has(key)) d.open = true;
+    d.addEventListener('toggle', () => { if (d.open) mgrOpen.add(key); else mgrOpen.delete(key); });
+    const s = document.createElement('summary');
+    const sentCount = (table.messages || []).filter((x) => x.from === 'manager').length;
+    s.textContent = `💬 Message the guest${sentCount ? ` (${sentCount} sent)` : ''}`;
+    d.appendChild(s);
+    (table.messages || []).filter((x) => x.from === 'manager').slice(-3).forEach((x) => {
+      const sent = document.createElement('div');
+      sent.className = 'mgr-reply-sent';
+      sent.innerHTML = `📣 <b>${escapeHtml(x.text)}</b> <span class="order-clock" data-order-ts="${x.ts}"></span>`;
+      d.appendChild(sent);
+    });
+    d.appendChild(replyBox(table.id, null));
+    card.appendChild(d);
+  }
+
+  // Full history of the visit: orders, requests, who saw them, when each was done
+  if (table.timeline && table.timeline.length) {
+    const key = `tl:${table.id}`;
+    const d = document.createElement('details');
+    d.className = 'mgr-timeline';
+    if (mgrOpen.has(key)) d.open = true;
+    d.addEventListener('toggle', () => { if (d.open) mgrOpen.add(key); else mgrOpen.delete(key); });
+    const s = document.createElement('summary');
+    s.textContent = `🕒 Everything that happened (${table.timeline.length})`;
+    d.appendChild(s);
+    d.appendChild(renderVisitTimeline(table.timeline));
+    card.appendChild(d);
+  }
+
+  if (table.status !== 'empty') {
+    const isPaid = !!(table.bill && table.bill.paid);
+    const clear = document.createElement('button');
+    clear.className = 'chip';
+    clear.style.cssText = 'width:100%; margin-top:8px; justify-content:center; text-align:center;';
+    clear.textContent = isPaid ? '✓ Guests left — clear table' : '🚪 Guests left — clear table';
+    clear.addEventListener('click', () => {
+      if (!isPaid && !confirm(`Clear Table ${table.number}? The guests will be recorded as having left without paying.`)) return;
+      const auth = getAuth();
+      if (auth) socket.emit('table:clear', { tableId: table.id, token: auth.token });
+    });
+    card.appendChild(clear);
   }
 
   if (table.status === 'empty' && !openRequests.length) {

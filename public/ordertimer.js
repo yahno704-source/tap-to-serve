@@ -145,6 +145,7 @@ setInterval(tickAll, 1000);
 // all behave identically to the order-placed clocks already on screen.
 const VISIT_EVENT_META = {
   seated: { icon: '🪑', label: 'Seated' },
+  preorder_moved: { icon: '🥡', label: 'Pre-order sent to table' },
   greeted: { icon: '👋', label: 'Greeted by waiter' },
   pickup_coming: { icon: '🏃', label: 'Waiter coming to get it' },
   drinks_ordered: { icon: '🥤', label: 'Drinks ordered' },
@@ -161,6 +162,7 @@ const VISIT_EVENT_META = {
   request_accepted: { icon: '👀', label: 'Waiter saw it' },
   request_completed: { icon: '✅', label: 'Request completed' },
   waiter_message: { icon: '💬', label: 'Waiter' },
+  manager_message: { icon: '📣', label: 'Manager' },
   complaint_sent: { icon: '🚩', label: 'Sent to manager' },
   complaint_resolved: { icon: '✅', label: 'Manager resolved it' },
 };

@@ -18,7 +18,8 @@ const escapeHtml = (s) =>
 
 // Things that have to survive a re-render: which table rows are expanded
 // and half-typed messages.
-const ui = { open: new Set(), drafts: {}, view: 'todo' };
+const ui = { open: new Set(), drafts: {}, view: 'todo', allSections: false };
+try { ui.allSections = localStorage.getItem('tts_waiter_all') === '1'; } catch {}
 
 const tabBar = document.getElementById('tabBar');
 const tabTodo = document.getElementById('tabTodo');
@@ -82,24 +83,42 @@ function buildTasks(section, myTables) {
     .forEach((w) => {
       const meta = state.seatTypes[w.seatType];
       const open = myTables.filter((t) => t.status === 'empty' && t.seatType === w.seatType);
+      // Nothing free of that type in my section? Offer tables in other sections so the guest is never stuck.
+      const others = open.length
+        ? []
+        : Object.values(state.tables)
+            .filter((t) => t.status === 'empty' && t.seatType === w.seatType && t.sectionId !== section.id)
+            .sort((a, b) => a.number - b.number)
+            .slice(0, 3);
+      const ownerOf = (t) => {
+        const wt = state.waiters.find((x) => x.sectionId === t.sectionId);
+        return wt ? `${wt.name}'s section` : (state.sections.find((s) => s.id === t.sectionId) || {}).name || 'another section';
+      };
       tasks.push({
         key: `wl:${w.id}`,
         ts: w.ts,
         where: 'At the door',
         icon: '🚪',
         title: `${w.guestName ? w.guestName + ' · ' : ''}Party of ${w.partySize || 1}`,
-        sub: `Wants a ${meta.label.toLowerCase()}`,
-        buttons: open.map((t) => ({
-          label: `Seat at Table ${t.number}`,
-          kind: 'go',
-          run: () => send('waiter:seat_from_waitlist', { waitlistId: w.id, tableId: t.id }),
-        })),
-        note: open.length ? '' : `No open ${meta.label.toLowerCase()} in ${section.name}`,
+        sub: `Wants a ${meta.label.toLowerCase()}` + (w.queue ? ` · #${w.queue.position} in line` : '') + (w.preorder ? ` · 🥡 pre-ordered, half paid ($${w.preorder.deposit.toFixed(2)})` : ''),
+        buttons: [
+          ...open.map((t) => ({
+            label: `Seat at Table ${t.number}`,
+            kind: 'go',
+            run: () => send('waiter:seat_from_waitlist', { waitlistId: w.id, tableId: t.id, waiterId }),
+          })),
+          ...others.map((t) => ({
+            label: `Table ${t.number} · ${ownerOf(t)}`,
+            kind: 'alt',
+            run: () => send('waiter:seat_from_waitlist', { waitlistId: w.id, tableId: t.id, waiterId }),
+          })),
+        ],
+        note: open.length ? '' : others.length ? `No open ${meta.label.toLowerCase()} in ${section.name} — seat them in another section:` : `No open ${meta.label.toLowerCase()} anywhere right now`,
       });
     });
 
   myTables.forEach((t) => {
-    const where = `Table ${t.number}`;
+    const where = t.sectionId === section.id ? `Table ${t.number}` : `Table ${t.number} · ${sectionOwner(t)}`;
 
     if (t.status === 'needs_greeting') {
       tasks.push({
@@ -142,14 +161,18 @@ function buildTasks(section, myTables) {
         // Done is allowed straight from "open": the customer's wait clock
         // only stops when a waiter says it's finished.
         buttons.push({
-          label: isBill ? '✓ Bill delivered' : '✓ Done',
+          label: isBill ? '✓ Bill delivered' : r.type === 'bathroom' ? '✓ Handled' : '✓ Done',
           kind: 'done',
           run: () => send('waiter:resolve_request', { tableId: t.id, requestId: r.id }),
         });
+        // Bathroom maintenance is flagged red and flashing so nobody scrolls past it.
+        const flash = r.type === 'bathroom';
         tasks.push({
           key: `req:${r.id}`, ts: r.ts, where, icon: meta.icon,
-          title: r.type === 'special' ? 'Special request' : isBill ? 'Wants the bill' : meta.label,
+          title: r.type === 'special' ? 'Special request' : isBill ? 'Wants the bill' : r.type === 'bathroom' ? 'Bathroom needs maintenance' : r.type === 'clean' ? 'Clean table / dirty utensils' : meta.label,
           sub: r.type === 'special' ? r.message : '',
+          urgent: flash,
+          flash,
           accepted: r.acceptedAt || null,
           buttons,
         });
@@ -200,7 +223,7 @@ function buildTasks(section, myTables) {
 
 function taskCard(task) {
   const card = document.createElement('div');
-  card.className = `w-task${task.urgent ? ' urgent' : ''}${task.group === 'ready' ? ' ready' : ''}${task.group === 'kitchen' ? ' in-progress' : ''}`;
+  card.className = `w-task${task.urgent ? ' urgent' : ''}${task.flash ? ' flash-red' : ''}${task.group === 'ready' ? ' ready' : ''}${task.group === 'kitchen' ? ' in-progress' : ''}`;
 
   const head = document.createElement('div');
   head.className = 'w-task-head';
@@ -265,6 +288,11 @@ function taskCard(task) {
 // ---------------------------------------------------------------------------
 // "My tables": one quiet row per table. Tap to open messages / orders.
 // ---------------------------------------------------------------------------
+function sectionOwner(t) {
+  const wt = state.waiters.find((x) => x.sectionId === t.sectionId);
+  return wt ? `${wt.name}'s section` : (state.sections.find((s) => s.id === t.sectionId) || {}).name || 'another section';
+}
+
 function tableRow(table, section) {
   const seat = state.seatTypes[table.seatType];
   const waiting = [
@@ -284,7 +312,8 @@ function tableRow(table, section) {
 
   const summary = document.createElement('summary');
   const notGreeted = table.status === 'seated' && table.greetedAt === null;
-  const label = table.status === 'empty' ? 'Open' : table.status === 'needs_greeting' ? 'Needs greeting' : 'In service';
+  const isPaid = !!(table.bill && table.bill.paid);
+  const label = table.status === 'empty' ? 'Open' : table.status === 'needs_greeting' ? 'Needs greeting' : isPaid ? '💳 Paid' : 'In service';
   if (notGreeted) details.classList.add('not-greeted');
   summary.innerHTML = `
     <span class="w-table-name">Table ${table.number}</span>
@@ -315,6 +344,18 @@ function tableRow(table, section) {
 
   const body = document.createElement('div');
   body.className = 'w-table-body';
+
+  // The guests have gone (paid or not): free the table up.
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'w-btn alt';
+  clearBtn.style.cssText = 'flex:none; width:100%;';
+  clearBtn.textContent = isPaid ? '✓ Guests left — clear this table' : '🚪 Guests left without paying — clear table';
+  clearBtn.addEventListener('click', () => {
+    if (!isPaid && !confirm(`Clear Table ${table.number}? The guests will be recorded as having left without paying.`)) return;
+    clearBtn.disabled = true;
+    send('table:clear', { tableId: table.id, token: (getAuth() || {}).token });
+  });
+  body.appendChild(clearBtn);
 
   [['🥤', table.drinkOrders], ['🍔', table.foodOrders]].forEach(([icon, orders]) =>
     orders.forEach((o) => {
@@ -614,8 +655,9 @@ function render() {
   const myRating = state.ratingsBySection && state.ratingsBySection[section.id];
   ratingPill.textContent = myRating && myRating.count ? `★ ${myRating.avg.toFixed(1)}` : '★ —';
 
+  // Own section, plus any table they seated from another section, or everything when 'All sections' is on.
   const myTables = Object.values(state.tables)
-    .filter((t) => t.sectionId === section.id)
+    .filter((t) => ui.allSections || t.sectionId === section.id || t.coverWaiterId === waiterId)
     .sort((a, b) => a.number - b.number);
   const tasks = buildTasks(section, myTables);
   Alerts.process(tasks.map((t) => ({ key: t.key, text: `${t.icon} ${t.where}: ${t.title}` })));
@@ -637,6 +679,22 @@ function render() {
     if (Math.abs(window.scrollY - scrollY) > 2) window.scrollTo(0, scrollY);
     return;
   }
+
+  // Who am I looking after? One tap to see every section (handy when one phone plays all the waiters).
+  const scope = document.createElement('div');
+  scope.className = 'w-scope';
+  scope.innerHTML = ui.allSections
+    ? '<span>👥 Showing <b>all sections</b></span>'
+    : `<span>Showing <b>${escapeHtml(section.name)}</b>${myTables.some((t) => t.sectionId !== section.id) ? ' + tables you seated' : ''}</span>`;
+  const scopeBtn = document.createElement('button');
+  scopeBtn.textContent = ui.allSections ? 'Only mine' : 'Show all sections';
+  scopeBtn.addEventListener('click', () => {
+    ui.allSections = !ui.allSections;
+    try { localStorage.setItem('tts_waiter_all', ui.allSections ? '1' : '0'); } catch {}
+    render();
+  });
+  scope.appendChild(scopeBtn);
+  app.appendChild(scope);
 
   // Three sections: finished food/drinks waiting to be picked up come first,
   // then everything else that needs a person, then orders still being made.
@@ -667,9 +725,9 @@ function render() {
 
   const tablesHead = document.createElement('h2');
   tablesHead.className = 'w-heading';
-  tablesHead.textContent = 'My tables';
+  tablesHead.textContent = ui.allSections ? 'All tables' : 'My tables';
   app.appendChild(tablesHead);
-  myTables.forEach((t) => app.appendChild(tableRow(t, section)));
+  myTables.forEach((t) => app.appendChild(tableRow(t, state.sections.find((s) => s.id === t.sectionId) || section)));
 
   restoreFocus(focus);
   if (Math.abs(window.scrollY - scrollY) > 2) window.scrollTo(0, scrollY);
