@@ -173,6 +173,8 @@ const REQUEST_TYPES = {
   ketchup: { label: 'Ketchup', icon: '🍅' },
   napkins: { label: 'Napkins', icon: '🧻' },
   service: { label: 'Service', icon: '🔧' },
+  clean: { label: 'Clean Table', icon: '🧽', hint: 'Dirty dishes & utensils' },
+  bathroom: { label: 'Bathroom', icon: '🚻', hint: 'Needs maintenance', urgent: true },
   bill: { label: 'Bill', icon: '🧾' },
   special: { label: 'Special Request', icon: '⭐' },
 };
@@ -196,6 +198,9 @@ function freshTable(id, number, sectionId, seatType) {
     seatType,
     status: 'empty', // empty -> needs_greeting -> seated
     seatedAt: null,
+    coverWaiterId: null, // a waiter from another section who seated this party and is covering the table
+    partySize: null, // how many guests were seated here
+    deposit: 0, // paid up front through a pre-order while waiting for this table; comes off the bill
     greetedAt: null, // set when a waiter actually greets the table; a seated table with this null still needs a greeting
     arrivedAt: null, // when the party showed up (door check-in / tapped "I'm here"), so wait-to-be-seated is measurable
     customerId: null, // logged-in customer account at this table
@@ -253,6 +258,8 @@ let prepLog; // finished kitchen/bar orders: { kind: food|drink, createdAt, read
 let ratings; // service ratings: { id, tableNumber, sectionId, stars, comment, ts }
 let suggestions; // anonymous by design — no table, section, or device info: { id, message, ts, archived }
 let visitLog; // archived per-table journeys, newest last: { id, tableNumber, sectionId, guestName, seatedAt, closedAt, timeline }
+// Paid bills waiting for the guest's end-of-visit survey (the table itself resets seconds after payment).
+const feedbackPending = new Map();
 let staffMessages; // manager -> staff, private: { id, to, text, ts, ackedBy: [staffKey] }. Never part of the state customers receive.
 
 function loadState() {
@@ -270,6 +277,7 @@ function loadState() {
       // already seated is treated as greeted so old data doesn't raise false alarms.
       if (t.greetedAt === undefined) t.greetedAt = t.status === 'seated' ? t.seatedAt || Date.now() : null;
       if (t.arrivedAt === undefined) t.arrivedAt = null;
+      if (t.deposit === undefined) t.deposit = 0;
     });
     completedBills = parsed.completedBills || [];
     complaints = parsed.complaints || [];
@@ -355,6 +363,82 @@ function computeSubtotal(table) {
   return ordersTotal(table.drinkOrders) + ordersTotal(table.foodOrders);
 }
 
+// ---------------------------------------------------------------------------
+// Waiting line: where each party is in the queue and when a table should open
+// up for them, estimated from how long tables usually stay occupied.
+// ---------------------------------------------------------------------------
+const PREORDER_LEAD_MS = 3 * 60 * 1000; // a waiting guest's food starts cooking this long before their table is expected
+
+function avgTurnMs() {
+  const recent = completedBills
+    .filter((b) => b.seatedAt && b.closedAt)
+    .slice(-20)
+    .map((b) => b.closedAt - b.seatedAt);
+  const avg = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : 45 * 60 * 1000;
+  return Math.min(90 * 60 * 1000, Math.max(20 * 60 * 1000, avg));
+}
+
+function queueEstimates() {
+  const now = Date.now();
+  const turn = avgTurnMs();
+  const freeAt = {}; // seat type -> sorted times when a table of that type opens up
+  Object.values(tables).forEach((t) => {
+    (freeAt[t.seatType] = freeAt[t.seatType] || []).push(
+      t.status === 'empty' ? now : Math.max(now + 2 * 60 * 1000, (t.seatedAt || now) + turn)
+    );
+  });
+  Object.values(freeAt).forEach((l) => l.sort((a, b) => a - b));
+  const out = {};
+  waitlist
+    .filter((w) => w.status === 'waiting')
+    .sort((a, b) => a.ts - b.ts)
+    .forEach((w, i) => {
+      const list = freeAt[w.seatType];
+      let est = null;
+      if (list && list.length) {
+        est = list.shift(); // this party takes the earliest table of its type...
+        list.push(est + turn); // ...which then frees up again one turn later for the next party
+        list.sort((a, b) => a - b);
+      }
+      out[w.id] = {
+        position: i + 1,
+        estSeatAt: est,
+        estWaitMin: est === null ? null : Math.max(0, Math.round((est - now) / 60000)),
+        tableAvailableNow: est !== null && est <= now,
+        releaseAt: est === null ? null : est - PREORDER_LEAD_MS,
+      };
+    });
+  return out;
+}
+
+// What clients get to see: each waiting party plus its place in line.
+function waitlistView() {
+  const est = queueEstimates();
+  return waitlist.map((w) => (w.status === 'waiting' ? { ...w, queue: est[w.id] || null } : w));
+}
+
+// Held pre-order food is released to the kitchen once the party is within
+// PREORDER_LEAD_MS of its estimated table time (or sooner, when they are seated).
+function releasePreorders() {
+  const est = queueEstimates();
+  const now = Date.now();
+  let changed = false;
+  waitlist.forEach((w) => {
+    const po = w.preorder;
+    const e = est[w.id];
+    if (w.status === 'waiting' && po && po.foodStatus === 'held' && e && e.releaseAt !== null && now >= e.releaseAt) {
+      po.foodStatus = 'new';
+      po.released = true;
+      po.releasedAt = now;
+      changed = true;
+    }
+  });
+  if (changed) {
+    broadcastState();
+    broadcastManagerState();
+  }
+}
+
 function todaysBills() {
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -421,7 +505,7 @@ function buildFullState() {
     seatTypes: SEAT_TYPES,
     tables,
     complaints,
-    waitlist,
+    waitlist: waitlistView(),
     tipsTodayBySection,
     recapBySection: recapBySection(),
     ratingsBySection: ratingsBySection(),
@@ -528,7 +612,7 @@ function broadcastManagerState() {
     requestTypes: REQUEST_TYPES,
     seatTypes: SEAT_TYPES,
     complaints,
-    waitlist,
+    waitlist: waitlistView(),
     stats: {
       // Subtotal only — tips are staff earnings, not restaurant revenue, and
       // are intentionally excluded from what the manager view can see.
@@ -792,6 +876,87 @@ app.post('/api/customer/logout', (req, res) => {
 // Realtime events
 // ---------------------------------------------------------------------------
 
+// Ends a visit: archives it for the manager's records and puts the table back to empty.
+// Safe to call twice (the second call finds a fresh table and does nothing).
+//   reason 'left' = the guest walked out without paying.
+function finishVisit(t, reason) {
+  if (!t || tables[t.id] !== t || t.status === 'empty') return;
+  const paid = !!(t.bill && t.bill.paid);
+  logEvent(t, 'visit_ended', !paid && reason === 'left' ? 'Guest left without paying' : null);
+  visitLog.push({
+    id: crypto.randomUUID(),
+    tableNumber: t.number,
+    sectionId: t.sectionId,
+    guestName: t.guestName,
+    arrivedAt: t.arrivedAt || null,
+    partySize: t.partySize || null,
+    seatedAt: t.seatedAt,
+    greetedAt: t.greetedAt || null,
+    closedAt: Date.now(),
+    subtotal: t.bill ? t.bill.subtotal : computeSubtotal(t),
+    tip: paid ? t.bill.tip : 0,
+    total: paid ? t.bill.total : 0,
+    unpaid: !paid,
+    timeline: t.timeline,
+  });
+  tables[t.id] = freshTable(t.id, t.number, t.sectionId, t.seatType);
+  broadcastState();
+  broadcastManagerState();
+}
+
+// Safety net: a paid table that was never cleared (e.g. the server restarted in the few seconds
+// after payment) is cleared here, so it can't stay stuck as "seated" forever.
+function sweepPaidTables() {
+  Object.values(tables).forEach((t) => {
+    if (t.bill && t.bill.paid && Date.now() - (t.bill.paidAt || 0) > 15000) finishVisit(t, 'paid');
+  });
+}
+
+// Seats a waiting party at an empty table of their type: moves any pre-order onto the table.
+function seatPartyAtTable(waitlistId, tableId, coverWaiterId) {
+  const entry = waitlist.find((w) => w.id === waitlistId && w.status === 'waiting');
+  const t = tables[tableId];
+  if (!entry || !t || t.status !== 'empty' || t.seatType !== entry.seatType) return;
+  t.status = 'seated';
+  t.seatedAt = Date.now();
+  t.arrivedAt = entry.ts;
+  t.partySize = entry.partySize || 1;
+  // Seated by a waiter from another section: they cover this table so its orders show on their screen.
+  const cover = WAITERS.find((w) => w.id === coverWaiterId);
+  if (cover && cover.sectionId !== t.sectionId) t.coverWaiterId = cover.id;
+  t.customerId = entry.customerId || null;
+  t.guestName = entry.guestName || null;
+  logEvent(t, 'seated', `Party of ${entry.partySize || 1} · waited ${waitLabel(t.seatedAt - t.arrivedAt)}`);
+  const po = entry.preorder;
+  if (po) {
+    const now = Date.now();
+    if (po.drinkItems.length) {
+      t.drinkOrders.push({ id: crypto.randomUUID(), items: po.drinkItems, status: 'new', ts: now, preorder: true });
+    }
+    if (po.foodItems.length) {
+      const order = {
+        id: crypto.randomUUID(),
+        items: po.foodItems,
+        status: po.foodStatus === 'held' ? 'new' : po.foodStatus, // seated = no more waiting, cook now
+        ts: po.releasedAt || now,
+        preorder: true,
+      };
+      if (po.foodReadyAt) order.readyAt = po.foodReadyAt;
+      t.foodOrders.push(order);
+    }
+    t.deposit = po.deposit;
+    logEvent(t, 'preorder_moved', `$${po.deposit.toFixed(2)} paid up front`);
+  }
+  entry.status = 'seated';
+  entry.tableId = tableId;
+  broadcastState();
+  broadcastManagerState();
+  setTimeout(() => {
+    waitlist = waitlist.filter((w) => w.id !== waitlistId);
+    broadcastState();
+  }, 6000);
+}
+
 io.on('connection', (socket) => {
   socket.emit('state:full', buildFullState());
 
@@ -830,6 +995,38 @@ io.on('connection', (socket) => {
     socket.emit('manager:reset_done');
   });
 
+  // DEMO: make every empty table look busy so a guest who checks in sees the waiting line.
+  // `openInMin` = how soon the first table is expected to free up (later ones follow every ~3 min).
+  socket.on('manager:demo_fill', ({ token, openInMin } = {}) => {
+    const session = sessions.get(token);
+    if (!session || session.role !== 'manager') return socket.emit('staff:auth_required');
+    if (process.env.DEMO_TOOLS === 'off') return;
+    const first = [2, 5, 10, 20].includes(Number(openInMin)) ? Number(openInMin) : 5;
+    const now = Date.now();
+    const turn = avgTurnMs();
+    const names = ['Maria', 'Chen', 'Dana', 'Priya', 'Okafor', 'Nguyen', 'Lee', 'Haddad', 'Rossi', 'Kim', 'Patel', 'Silva', 'Novak', 'Ito', 'Garcia', 'Cohen'];
+    const byType = {};
+    Object.values(tables).forEach((t) => {
+      if (t.status === 'empty') (byType[t.seatType] = byType[t.seatType] || []).push(t);
+    });
+    let filled = 0;
+    Object.values(byType).forEach((list) => {
+      list.sort((a, b) => a.number - b.number).forEach((t, i) => {
+        const freesIn = (first + i * 3) * 60 * 1000;
+        const seatedAt = now - Math.max(5 * 60 * 1000, turn - freesIn); // so it should free up in `freesIn`
+        t.status = 'seated';
+        t.guestName = names[(t.number - 1) % names.length];
+        t.seatedAt = seatedAt;
+        t.arrivedAt = seatedAt - 3 * 60 * 1000;
+        t.greetedAt = seatedAt + 45 * 1000;
+        t.timeline = [{ event: 'seated', detail: 'Demo guest', ts: seatedAt }];
+        filled++;
+      });
+    });
+    broadcastState();
+    broadcastManagerState();
+    socket.emit('manager:demo_done', { filled, first });
+  });
   // --- Private staff messaging -----------------------------------------
   socket.on('staff:subscribe', ({ token } = {}) => {
     const session = sessions.get(token);
@@ -888,24 +1085,64 @@ io.on('connection', (socket) => {
     broadcastManagerState();
   });
 
-  socket.on('waiter:seat_from_waitlist', ({ waitlistId, tableId }) => {
-    const entry = waitlist.find((w) => w.id === waitlistId && w.status === 'waiting');
-    const t = tables[tableId];
-    if (!entry || !t || t.status !== 'empty' || t.seatType !== entry.seatType) return;
-    t.status = 'seated';
-    t.seatedAt = Date.now();
-    t.arrivedAt = entry.ts;
-    t.customerId = entry.customerId || null;
-    t.guestName = entry.guestName || null;
-    logEvent(t, 'seated', `Party of ${entry.partySize || 1} · waited ${waitLabel(t.seatedAt - t.arrivedAt)}`);
-    entry.status = 'seated';
-    entry.tableId = tableId;
+  // A waiting guest orders ahead and pays half now. Drinks go to the table when they're
+  // seated; food is held and only reaches the kitchen ~3 min before the table is expected.
+  // NOTE: the "payment" here is simulated — wire a real payment provider before launch.
+  socket.on('customer:preorder', ({ checkinId, items, customerToken }) => {
+    const customer = customerFromToken(customerToken);
+    if (!customer) return socket.emit('customer:auth_required');
+    const entry = waitlist.find((w) => w.id === checkinId && w.status === 'waiting' && w.customerId === customer.id);
+    if (!entry || entry.preorder || !Array.isArray(items)) return;
+    const clean = items
+      .slice(0, 30)
+      .map((it) => {
+        const m = menuItem(it && it.id);
+        const qty = Math.min(20, Math.max(0, Math.round(Number(it && it.qty) || 0)));
+        return m && qty ? { id: m.id, name: m.name, qty, ...(it.note ? { note: String(it.note).slice(0, 80) } : {}) } : null;
+      })
+      .filter(Boolean);
+    if (!clean.length) return;
+    const subtotal = clean.reduce((s, it) => s + priceFor(it.id) * it.qty, 0);
+    const foodItems = clean.filter((i) => menuItem(i.id).category === 'food');
+    const drinkItems = clean.filter((i) => menuItem(i.id).category === 'drink');
+    entry.preorder = {
+      foodItems,
+      drinkItems,
+      subtotal,
+      deposit: Math.round(subtotal * 50) / 100, // exactly half
+      paidAt: Date.now(),
+      foodStatus: foodItems.length ? 'held' : null, // held -> new -> cooking -> ready
+      released: false,
+      releasedAt: null,
+      foodReadyAt: null,
+    };
+    releasePreorders(); // already within 3 min of their table? it goes straight to the kitchen
     broadcastState();
     broadcastManagerState();
-    setTimeout(() => {
-      waitlist = waitlist.filter((w) => w.id !== waitlistId);
-      broadcastState();
-    }, 6000);
+  });
+
+  socket.on('waiter:seat_from_waitlist', ({ waitlistId, tableId, waiterId }) => seatPartyAtTable(waitlistId, tableId, waiterId));
+
+  // TESTING / DEMO ONLY: seat a waiting guest right now, clearing a table of their type if
+  // every one is taken. Lets one person walk through the whole flow alone.
+  // Set DEMO_TOOLS=off in production to disable.
+  socket.on('customer:demo_seat', ({ checkinId, customerToken }) => {
+    if (process.env.DEMO_TOOLS === 'off') return;
+    const customer = customerFromToken(customerToken);
+    if (!customer) return socket.emit('customer:auth_required');
+    const entry = waitlist.find((w) => w.id === checkinId && w.status === 'waiting' && w.customerId === customer.id);
+    if (!entry) return;
+    let table = Object.values(tables).find((x) => x.status === 'empty' && x.seatType === entry.seatType);
+    if (!table) {
+      const sameType = Object.values(tables)
+        .filter((x) => x.seatType === entry.seatType)
+        .sort((a, b) => (a.seatedAt || 0) - (b.seatedAt || 0));
+      if (!sameType.length) return;
+      const v = sameType[0]; // the table that has been occupied the longest
+      tables[v.id] = freshTable(v.id, v.number, v.sectionId, v.seatType);
+      table = tables[v.id];
+    }
+    seatPartyAtTable(entry.id, table.id);
   });
 
   // --- Customer actions -----------------------------------------------
@@ -1028,6 +1265,29 @@ io.on('connection', (socket) => {
     broadcastManagerState();
   });
 
+  // End-of-visit survey, answered after the bill is paid (so it works even once the table has reset).
+  socket.on('customer:feedback', ({ feedbackId, service, food, wouldReturn, comment }) => {
+    const pending = feedbackPending.get(feedbackId);
+    if (!pending) return;
+    const s = Math.round(Number(service));
+    if (!(s >= 1 && s <= 5)) return;
+    feedbackPending.delete(feedbackId);
+    const f = Math.round(Number(food));
+    ratings.push({
+      id: crypto.randomUUID(),
+      tableNumber: pending.tableNumber,
+      sectionId: pending.sectionId,
+      stars: s,
+      food: f >= 1 && f <= 5 ? f : null,
+      wouldReturn: ['yes', 'maybe', 'no'].includes(wouldReturn) ? wouldReturn : null,
+      comment: String(comment || '').trim().slice(0, 300),
+      ts: Date.now(),
+      afterVisit: true,
+    });
+    broadcastState();
+    broadcastManagerState();
+  });
+
   socket.on('complaint:resolve', ({ complaintId }) => {
     const c = complaints.find((x) => x.id === complaintId);
     if (!c || c.status !== 'open') return;
@@ -1045,7 +1305,16 @@ io.on('connection', (socket) => {
     const safeTip = Math.max(0, Number(tip) || 0);
     t.bill.tip = safeTip;
     t.bill.total = t.bill.subtotal + safeTip;
+    t.bill.due = Math.max(0, t.bill.total - (t.bill.deposit || 0)); // what is actually charged now
     t.bill.paid = true;
+    t.bill.paidAt = Date.now();
+    // Ask how the visit went. If they already reviewed the service during the meal, don't ask twice.
+    t.bill.feedbackId = crypto.randomUUID();
+    t.bill.alreadyRated = !!t.rated;
+    if (!t.rated) {
+      feedbackPending.set(t.bill.feedbackId, { tableNumber: t.number, sectionId: t.sectionId, createdAt: Date.now() });
+      for (const [k, v] of feedbackPending) if (Date.now() - v.createdAt > 2 * 60 * 60 * 1000) feedbackPending.delete(k);
+    }
     logEvent(t, 'bill_paid', `Total $${t.bill.total.toFixed(2)}` + (safeTip ? ` (tip $${safeTip.toFixed(2)})` : ''));
     const soldItems = [...t.drinkOrders, ...t.foodOrders].flatMap((o) =>
       o.items.map((it) => ({ name: it.name, qty: it.qty, price: priceFor(it.id) }))
@@ -1062,26 +1331,16 @@ io.on('connection', (socket) => {
     });
     broadcastState();
     broadcastManagerState();
-    setTimeout(() => {
-      logEvent(t, 'visit_ended');
-      visitLog.push({
-        id: crypto.randomUUID(),
-        tableNumber: t.number,
-        sectionId: t.sectionId,
-        guestName: t.guestName,
-        arrivedAt: t.arrivedAt || null,
-        seatedAt: t.seatedAt,
-        greetedAt: t.greetedAt || null,
-        closedAt: Date.now(),
-        subtotal: t.bill.subtotal,
-        tip: safeTip,
-        total: t.bill.total,
-        timeline: t.timeline,
-      });
-      tables[tableId] = freshTable(t.id, t.number, t.sectionId, t.seatType);
-      broadcastState();
-      broadcastManagerState();
-    }, 3500);
+    setTimeout(() => finishVisit(t, 'paid'), 3500);
+  });
+
+  // A waiter or the manager clears a table once the guests are gone (paid or not).
+  socket.on('table:clear', ({ tableId, token } = {}) => {
+    const session = sessions.get(token);
+    if (!session || (session.role !== 'waiter' && session.role !== 'manager')) return socket.emit('staff:auth_required');
+    const t = tables[tableId];
+    if (!t || t.status === 'empty') return;
+    finishVisit(t, 'left');
   });
 
   // --- Waiter actions ----------------------------------------------------
@@ -1176,8 +1435,26 @@ io.on('connection', (socket) => {
     if (!t || t.status !== 'seated') return;
     const clean = String(text || '').trim().slice(0, 200);
     if (!clean) return;
-    t.messages.push({ id: crypto.randomUUID(), text: clean, ts: Date.now() });
+    t.messages.push({ id: crypto.randomUUID(), text: clean, ts: Date.now(), from: 'waiter' });
     logEvent(t, 'waiter_message', clean);
+    broadcastState();
+    broadcastManagerState();
+  });
+
+  // The manager writes back to a guest at their table (e.g. "I'm on my way", or a reply to a
+  // complaint). It appears on the guest's screen like a waiter message, labelled as the manager.
+  socket.on('manager:message_guest', ({ token, tableId, text, complaintId } = {}) => {
+    const session = sessions.get(token);
+    if (!session || session.role !== 'manager') return socket.emit('staff:auth_required');
+    const t = tables[tableId];
+    if (!t || t.status !== 'seated') return;
+    const clean = String(text || '').trim().slice(0, 300);
+    if (!clean) return;
+    const now = Date.now();
+    t.messages.push({ id: crypto.randomUUID(), text: clean, ts: now, from: 'manager' });
+    logEvent(t, 'manager_message', clean);
+    const c = complaintId && complaints.find((x) => x.id === complaintId && x.tableId === tableId);
+    if (c) c.replies = [...(c.replies || []), { text: clean, ts: now }];
     broadcastState();
     broadcastManagerState();
   });
@@ -1204,7 +1481,7 @@ io.on('connection', (socket) => {
     if (r.type === 'bill') {
       // Deliver the bill: compute the total and let the customer take it from here.
       const subtotal = computeSubtotal(t);
-      t.bill = { subtotal, tip: 0, total: subtotal, paid: false, deliveredAt: Date.now() };
+      t.bill = { subtotal, deposit: t.deposit || 0, tip: 0, total: subtotal, paid: false, deliveredAt: Date.now() };
       logEvent(t, 'bill_delivered', `$${subtotal.toFixed(2)}`);
     } else {
       logEvent(t, 'request_completed', r.type === 'special' ? r.message : REQUEST_TYPES[r.type].label);
@@ -1234,6 +1511,21 @@ io.on('connection', (socket) => {
   });
 
   // --- Kitchen actions -----------------------------------------------------
+  socket.on('kitchen:advance_preorder', ({ waitlistId }) => {
+    const entry = waitlist.find((w) => w.id === waitlistId && w.status === 'waiting');
+    const po = entry && entry.preorder;
+    if (!po || !po.foodItems.length) return;
+    if (po.foodStatus === 'new') {
+      po.foodStatus = 'cooking';
+    } else if (po.foodStatus === 'cooking') {
+      po.foodStatus = 'ready';
+      po.foodReadyAt = Date.now();
+      prepLog.push({ kind: 'food', createdAt: po.releasedAt || po.paidAt, readyAt: po.foodReadyAt });
+    }
+    broadcastState();
+    broadcastManagerState();
+  });
+
   socket.on('kitchen:advance_order', ({ tableId, orderId }) => {
     const t = tables[tableId];
     if (!t) return;
@@ -1251,6 +1543,10 @@ io.on('connection', (socket) => {
     broadcastManagerState();
   });
 });
+
+setInterval(releasePreorders, 10000);
+setInterval(sweepPaidTables, 5000);
+sweepPaidTables();
 
 server.listen(PORT, () => {
   console.log(`Tap to Serve running on http://localhost:${PORT}`);
